@@ -217,7 +217,8 @@ def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
     data["rpm_efficiency"] = data["rpm"] / 5000  # Normalized to typical peak RPM
     
     # DISTANCE TRAVELED - cumulative distance in meters
-    data["distance_traveled"] = (data["speed"] * data["dt"]).cumsum()
+    # Speed is in km/h, dt is in seconds. Convert: distance(m) = speed(km/h) * dt(s) / 3.6
+    data["distance_traveled"] = (data["speed"] * data["dt"] / 3.6).cumsum()
     
     # Lateral acceleration for handling analysis
     data["lateral_accel"] = (data["slip_severity"] * data["speed"] / 127).clip(0, 2.5)
@@ -326,16 +327,20 @@ def analyze_braking_timing(data: pd.DataFrame) -> Dict[str, pd.Series]:
 
 
 def detect_events(data: pd.DataFrame, thresholds: Dict[str, float]) -> Dict[str, pd.Series]:
-    oversteer = (
+    # Traction loss: when slip exceeds threshold in corners
+    traction_loss = (
         data["corner_zone"]
         & (data["slip_severity"] > thresholds["slip_high"])
+    )
+    # Oversteer: traction loss with high yaw rate
+    oversteer = (
+        traction_loss
         & (data["yaw_abs"] > thresholds["yaw_high"])
     )
+    # Understeer: traction loss with low yaw response
     understeer = (
-        data["corner_zone"]
-        & (data["steering_abs"] > thresholds["corner_threshold"] * 1.15)
+        traction_loss
         & (data["yaw_response"] < thresholds["yaw_response_low"])
-        & (data["speed"] > thresholds["mid_speed"])
     )
     harsh_braking = (
         data["braking_zone"]
@@ -356,27 +361,17 @@ def detect_events(data: pd.DataFrame, thresholds: Dict[str, float]) -> Dict[str,
         data["throttle_zone"]
         & (data["rpm"] > thresholds["rpm_high"])
     )
-    unstable = (
-        (data["stability_index"].abs() > thresholds["stability_high"])
-        | oversteer
-        | understeer
-        | harsh_braking
-        | (
-            data["corner_zone"]
-            & (data["input_change"] > safe_quantile(data["input_change"], 0.90, 0.20))
-            & (data["slip_severity"] > thresholds["slip_medium"])
-        )
-    )
+    # Remove unstable parameter as requested - oversteer/understeer cover instability
     braking_timing = analyze_braking_timing(data)
 
     return {
         "oversteer": oversteer.fillna(False),
         "understeer": understeer.fillna(False),
+        "traction_loss": traction_loss.fillna(False),
         "harsh_braking": harsh_braking.fillna(False),
         "late_braking": braking_timing["late_braking"].fillna(False),
         "early_braking": braking_timing["early_braking"].fillna(False),
         "wheel_spin": wheel_spin.fillna(False),
-        "unstable": unstable.fillna(False),
         "low_rpm_issue": low_rpm_issue.fillna(False),
         "high_rpm_issue": high_rpm_issue.fillna(False),
     }
@@ -645,9 +640,11 @@ def generate_insights(
 
 
 def build_stats(data: pd.DataFrame) -> Dict[str, float]:
-    total_distance = float(data["distance_traveled"].iloc[-1])
+    # Ensure distance and time are taken from data columns directly
+    total_distance = float(data["distance_traveled"].iloc[-1]) if "distance_traveled" in data.columns else 0.0
+    lap_time = float(data["time"].iloc[-1] - data["time"].iloc[0]) if "time" in data.columns else float(data["relative_time"].iloc[-1])
     return {
-        "lap_time": float(data["relative_time"].iloc[-1]),
+        "lap_time": lap_time,
         "lap_distance": total_distance,
         "average_speed": float(data["speed"].mean()),
         "top_speed": float(data["speed"].max()),
