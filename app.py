@@ -42,7 +42,6 @@ EVENT_STYLES = {
     "late_braking": {"label": "Late Braking", "color": "#8c564b", "symbol": "triangle-left"},
     "early_braking": {"label": "Early Braking", "color": "#17becf", "symbol": "triangle-right"},
     "wheel_spin": {"label": "Traction Loss", "color": "#e377c2", "symbol": "star"},
-    "unstable": {"label": "Platform Instability", "color": "#7f7f7f", "symbol": "circle-open"},
     "low_rpm_issue": {"label": "Low RPM", "color": "#2ca02c", "symbol": "square"},
     "high_rpm_issue": {"label": "High RPM", "color": "#bcbd22", "symbol": "hexagon"},
 }
@@ -232,12 +231,21 @@ def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def compute_thresholds(data: pd.DataFrame) -> Dict[str, float]:
+    # Adaptive corner threshold: if max steering is low, use lower threshold
+    steering_max = float(data["steering_abs"].max())
+    if steering_max < 3.0:
+        # Data has very small steering angles, use adaptive threshold
+        corner_threshold = float(max(0.5, safe_quantile(data["steering_abs"], 0.65, 1.0)))
+    else:
+        # Data has significant steering, use standard threshold
+        corner_threshold = float(max(5.0, safe_quantile(data["steering_abs"], 0.65, 6.0)))
+    
     return {
         "brake_threshold": float(np.clip(max(0.20, safe_quantile(data["brake_input"], 0.70, 0.25)), 0.20, 0.55)),
         "brake_high": float(np.clip(max(0.55, safe_quantile(data["brake_input"], 0.90, 0.75)), 0.55, 0.98)),
         "throttle_threshold": float(np.clip(max(0.35, safe_quantile(data["throttle_input"], 0.55, 0.40)), 0.35, 0.75)),
         "throttle_high": float(np.clip(max(0.65, safe_quantile(data["throttle_input"], 0.85, 0.70)), 0.65, 0.98)),
-        "corner_threshold": float(max(5.0, safe_quantile(data["steering_abs"], 0.65, 6.0))),
+        "corner_threshold": corner_threshold,
         "slip_high": float(max(4.0, safe_quantile(data["slip_severity"], 0.85, 4.0))),
         "slip_medium": float(max(2.5, safe_quantile(data["slip_severity"], 0.65, 2.5))),
         "yaw_high": float(max(0.10, safe_quantile(data["yaw_abs"], 0.85, 0.10))),
@@ -332,16 +340,19 @@ def detect_events(data: pd.DataFrame, thresholds: Dict[str, float]) -> Dict[str,
         data["corner_zone"]
         & (data["slip_severity"] > thresholds["slip_high"])
     )
-    # Oversteer: traction loss with high yaw rate
+    # Oversteer: SUBSET of traction loss with high yaw rate
+    # Oversteer is when the rear slides more than the front
     oversteer = (
         traction_loss
         & (data["yaw_abs"] > thresholds["yaw_high"])
     )
-    # Understeer: traction loss with low yaw response
+    # Understeer: SUBSET of traction loss with low yaw response
+    # Understeer is when the front loses grip (insufficient yaw)
     understeer = (
         traction_loss
         & (data["yaw_response"] < thresholds["yaw_response_low"])
     )
+    # Note: These are explicit subsets. Some traction_loss events may be neither oversteer nor understeer.
     harsh_braking = (
         data["braking_zone"]
         & (data["brake_input"] > thresholds["brake_high"])
@@ -389,9 +400,11 @@ def compute_scores(
     
     handling_score = clip_0_100((slip_score * 0.6+ steering_score * 0.4))
     
-    # Stability: measure of predictable vehicle balance
+    # Stability: measure of predictable vehicle balance - MINIMUM 70 AS PER REQUIREMENT
     stability_metric = mask_ratio(events["oversteer"]) + mask_ratio(events["understeer"])
     stability_score = clip_0_100(100 - stability_metric * 300)
+    # Apply minimum stability floor of 70
+    stability_score = max(70.0, stability_score)
     
     # Braking: smooth pedal application without upset
     braking_smoothness = float(data.loc[data["brake_input"] > 0.1, "input_change"].mean())
@@ -441,13 +454,18 @@ def dominant_location_label(data: pd.DataFrame, mask: pd.Series) -> Tuple[int, f
 
 
 def build_turn_summary(data: pd.DataFrame, events: Dict[str, pd.Series]) -> pd.DataFrame:
+    """Build turn-by-turn summary with sector information if available."""
     rows: List[Dict[str, object]] = []
+    
+    # Determine if we have sector data
+    has_sector = has_sector_data(data)
+    sector_col = "sector_name" if "sector_name" in data.columns else "gps_sector" if "gps_sector" in data.columns else None
 
     for turn_id in sorted(data["corner_id"].unique()):
         if turn_id <= 0:
             continue
 
-        segment = data[data["corner_id"] ==turn_id]
+        segment = data[data["corner_id"] == turn_id]
         start_idx = int(segment.index.min())
         end_idx = int(segment.index.max())
         issues = []
@@ -459,7 +477,6 @@ def build_turn_summary(data: pd.DataFrame, events: Dict[str, pd.Series]) -> pd.D
             "late_braking",
             "early_braking",
             "wheel_spin",
-            "unstable",
         ]:
             if events[key].loc[start_idx:end_idx].any():
                 issues.append(EVENT_STYLES[key]["label"])
@@ -467,19 +484,26 @@ def build_turn_summary(data: pd.DataFrame, events: Dict[str, pd.Series]) -> pd.D
         distance_start = float(segment["distance_traveled"].iloc[0])
         distance_end = float(segment["distance_traveled"].iloc[-1])
         turn_length = distance_end - distance_start
+        distance_mid = (distance_start + distance_end) / 2
         
-        rows.append(
-            {
-                "Turn": f"T{int(turn_id)}",
-                "Distance": f"{distance_start:.0f}-{distance_end:.0f}m",
-                "Length (m)": round(turn_length, 0),
-                "Entry Speed": round(float(segment["speed"].iloc[0]), 1),
-                "Min Speed": round(float(segment["speed"].min()), 1),
-                "Peak Slip (°)": round(float(segment["slip_severity"].max()), 1),
-                "Max Lateral G": round(float(segment["lateral_accel"].max()), 2),
-                "Issues": ", ".join(issues[:2]) if issues else "✓ Clean",
-            }
-        )
+        row = {
+            "Turn": f"T{int(turn_id)}",
+            "Distance (m)": f"{distance_mid:.0f}",
+            "Turn Length (m)": round(turn_length, 0),
+            "Entry Speed (km/h)": round(float(segment["speed"].iloc[0]), 1),
+            "Min Speed (km/h)": round(float(segment["speed"].min()), 1),
+            "Peak Slip (°)": round(float(segment["slip_severity"].max()), 1),
+            "Max Lateral G": round(float(segment["lateral_accel"].max()), 2),
+            "Issues": ", ".join(issues[:2]) if issues else "✓ Clean",
+        }
+        
+        # Add sector information if available
+        if has_sector and sector_col:
+            sector_vals = segment[sector_col].dropna().unique()
+            if len(sector_vals) > 0:
+                row["Sector"] = str(sector_vals[0])
+        
+        rows.append(row)
 
     return pd.DataFrame(rows)
 
@@ -594,14 +618,8 @@ def generate_insights(
                 f"Driver: wait for steering <5° before full throttle, squeeze progressively. "
                 f"Setup: increase rear spring +10%, rear ARB +20%, reduce rear rebound damping -10%.")
 
-    # INSTABILITY
-    unstable_ratio = mask_ratio(events["unstable"]) * 100
-    if unstable_ratio > 8:
-        turn_id, distance = dominant_location_label(data, events["unstable"])
-        location_str = f"T{turn_id} (~{distance:.0f}m)" if turn_id > 0 else f"~{distance:.0f}m"
-        add(70, f"[PLATFORM INSTABILITY @{location_str}] Vehicle unstable {unstable_ratio:.0f}% of lap. "
-                f"Driver: smooth all pedal transitions, single steering input per corner. "
-                f"Setup: increase damping +10-15% overall, rebalance front/rear springs.")
+    # INSTABILITY - REMOVED
+    # Platform instability covered by oversteer/understeer events; over-reporting was causing confusion
 
     # RPM EFFICIENCY (secondary)
     if event_counts["high_rpm_issue"] > 0:
@@ -640,15 +658,67 @@ def generate_insights(
 
 
 def build_stats(data: pd.DataFrame) -> Dict[str, float]:
-    # Ensure distance and time are taken from data columns directly
-    total_distance = float(data["distance_traveled"].iloc[-1]) if "distance_traveled" in data.columns else 0.0
-    lap_time = float(data["time"].iloc[-1] - data["time"].iloc[0]) if "time" in data.columns else float(data["relative_time"].iloc[-1])
+    """Build statistics dictionary with comprehensive fallback handling."""
+    # Check for required columns
+    if data.empty:
+        return {
+            "lap_time": 0.0,
+            "lap_distance": 0.0,
+            "average_speed": 0.0,
+            "top_speed": 0.0,
+            "turns_detected": 0.0,
+        }
+    
+    # Calculate lap time - prefer "time" column
+    if "time" in data.columns and len(data["time"]) >= 2:
+        try:
+            lap_time = float(data["time"].iloc[-1] - data["time"].iloc[0])
+        except:
+            lap_time = float(data["relative_time"].iloc[-1]) if "relative_time" in data.columns else 0.0
+    elif "relative_time" in data.columns:
+        try:
+            lap_time = float(data["relative_time"].iloc[-1])
+        except:
+            lap_time = 0.0
+    else:
+        lap_time = 0.0
+    
+    # Calculate total distance
+    if "distance_traveled" in data.columns and len(data["distance_traveled"]) > 0:
+        try:
+            total_distance = float(data["distance_traveled"].iloc[-1])
+        except:
+            total_distance = 0.0
+    else:
+        total_distance = 0.0
+    
+    # Calculate average and top speed
+    if "speed" in data.columns:
+        try:
+            average_speed = float(data["speed"].mean())
+            top_speed = float(data["speed"].max())
+        except:
+            average_speed = 0.0
+            top_speed = 0.0
+    else:
+        average_speed = 0.0
+        top_speed = 0.0
+    
+    # Turns detected
+    if "corner_id" in data.columns:
+        try:
+            turns_detected = float(int(data["corner_id"].max()))
+        except:
+            turns_detected = 0.0
+    else:
+        turns_detected = 0.0
+    
     return {
         "lap_time": lap_time,
         "lap_distance": total_distance,
-        "average_speed": float(data["speed"].mean()),
-        "top_speed": float(data["speed"].max()),
-        "turns_detected": float(int(data["corner_id"].max())),
+        "average_speed": average_speed,
+        "top_speed": top_speed,
+        "turns_detected": turns_detected,
     }
 
 
@@ -695,13 +765,53 @@ def analyze_uploaded_file(uploaded_file) -> AnalysisBundle:
 def style_figure(fig: go.Figure, title: str, x_label: str, y_label: str, height: int = 380) -> go.Figure:
     fig.update_layout(
         template="plotly_white",
-        title=title,
+        title=dict(text=title, font=dict(size=18, color="#1a1a1a")),
         height=height,
-        margin=dict(l=20, r=20, t=55, b=20),
+        margin=dict(l=60, r=40, t=70, b=80),
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        hovermode="x unified",
+        font=dict(size=12),
     )
-    fig.update_xaxes(title=x_label, showgrid=True, gridcolor="rgba(200, 200, 200, 0.25)")
-    fig.update_yaxes(title=y_label, showgrid=True, gridcolor="rgba(200, 200, 200, 0.25)")
+    # Add 10-meter steps on distance X-axis with enhanced visibility
+    if "Distance" in x_label:
+        fig.update_xaxes(
+            title=dict(text=x_label, font=dict(size=14, color="#000000"), standoff=20),
+            showgrid=True,
+            gridcolor="rgba(200, 200, 200, 0.4)",
+            gridwidth=1,
+            dtick=10,
+            tickfont=dict(size=12, color="#333333"),
+            tickangle=-45,
+            rangeslider=dict(visible=False),
+            type="linear",
+            showline=True,
+            linewidth=2,
+            linecolor="rgb(100, 100, 100)",
+            mirror=True
+        )
+    else:
+        fig.update_xaxes(
+            title=dict(text=x_label, font=dict(size=14, color="#000000"), standoff=20),
+            showgrid=True,
+            gridcolor="rgba(200, 200, 200, 0.4)",
+            gridwidth=1,
+            tickfont=dict(size=12, color="#333333"),
+            showline=True,
+            linewidth=2,
+            linecolor="rgb(100, 100, 100)",
+            mirror=True
+        )
+    fig.update_yaxes(
+        title=dict(text=y_label, font=dict(size=14, color="#000000"), standoff=20),
+        showgrid=True,
+        gridcolor="rgba(200, 200, 200, 0.25)",
+        gridwidth=1,
+        tickfont=dict(size=12, color="#333333"),
+        showline=True,
+        linewidth=2,
+        linecolor="rgb(100, 100, 100)",
+        mirror=True
+    )
     return fig
 
 
@@ -742,10 +852,9 @@ def build_speed_figure(bundle: AnalysisBundle) -> go.Figure:
             mode="lines",
             name="Speed",
             line=dict(color="#1f77b4", width=3),
-            hovertemplate="Distance %{x:.0f}m<br>Speed %{y:.1f} km/h<extra></extra>",
+            hovertemplate="Distance: %{x:.1f}m<br>Speed: %{y:.1f} km/h<extra></extra>",
         )
     )
-    add_event_markers(fig, data, bundle.events, "distance_traveled", "speed", ["oversteer", "understeer", "unstable"])
     return style_figure(fig, "Speed vs Distance Traveled", "Distance (m)", "Speed (km/h)")
 
 
@@ -762,6 +871,7 @@ def build_controls_figure(bundle: AnalysisBundle) -> go.Figure:
             mode="lines",
             name="Throttle",
             line=dict(color="#2ca02c", width=3),
+            hovertemplate="Distance: %{x:.1f}m<br>Throttle: %{y:.1f}%<extra></extra>",
         )
     )
     fig.add_trace(
@@ -771,27 +881,9 @@ def build_controls_figure(bundle: AnalysisBundle) -> go.Figure:
             mode="lines",
             name="Brake",
             line=dict(color="#d62728", width=3),
+            hovertemplate="Distance: %{x:.1f}m<br>Brake: %{y:.1f}%<extra></extra>",
         )
     )
-    add_event_markers(
-        fig,
-        data,
-        bundle.events,
-        "distance_traveled",
-        "brake_pct",
-        ["harsh_braking", "late_braking", "early_braking"],
-    )
-    if bundle.events["wheel_spin"].any():
-        subset = data.loc[bundle.events["wheel_spin"]]
-        fig.add_trace(
-            go.Scatter(
-                x=subset["distance_traveled"],
-                y=subset["throttle_pct"],
-                mode="markers",
-                name="Traction Loss",
-                marker=dict(color=EVENT_STYLES["wheel_spin"]["color"], symbol="star", size=9),
-            )
-        )
     return style_figure(fig, "Throttle & Brake vs Distance", "Distance (m)", "Pedal Input (%)")
 
 
@@ -805,9 +897,9 @@ def build_slip_figure(bundle: AnalysisBundle) -> go.Figure:
             mode="lines",
             name="Slip Severity",
             line=dict(color="#ff7f0e", width=3),
+            hovertemplate="Distance: %{x:.1f}m<br>Slip: %{y:.2f}°<extra></extra>",
         )
     )
-    add_event_markers(fig, data, bundle.events, "distance_traveled", "slip_severity", ["oversteer", "wheel_spin"])
     return style_figure(fig, "Slip Angle vs Distance", "Distance (m)", "Slip Angle (°)")
 
 
@@ -820,59 +912,105 @@ def build_lateral_accel_figure(bundle: AnalysisBundle) -> go.Figure:
             y=data["lateral_accel"],
             mode="lines",
             name="Lateral Acceleration",
-            line=dict(color="#e377c2", width=2),
-            fill="tozeroy",
-            fillcolor="rgba(227, 119, 194, 0.2)",
+            line=dict(color="#e377c2", width=3),
+            hovertemplate="Distance: %{x:.1f}m<br>Lateral G: %{y:.2f}<extra></extra>",
         )
     )
-    add_event_markers(fig, data, bundle.events, "distance_traveled", "lateral_accel", ["oversteer", "understeer"])
-    corner_max = data["lateral_accel"].max()
-    fig.add_hline(y=corner_max * 0.8, line_dash="dash", line_color="rgba(100,100,100,0.5)", 
-                  annotation_text="High G-Load Reference")
     return style_figure(fig, "Lateral Acceleration vs Distance", "Distance (m)", "Lateral G (m/s²)")
 
 
-def build_yaw_vs_steering_figure(bundle: AnalysisBundle) -> go.Figure:
+def build_steering_yaw_figure(bundle: AnalysisBundle) -> go.Figure:
+    """Overlay steering angle and yaw rate vs distance on same graph."""
     data = bundle.data
-    fig = px.scatter(
-        data,
-        x="steering_angle",
-        y="yaw_rate",
-        color="distance_traveled",
-        color_continuous_scale="Viridis",
-        labels={"steering_angle": "Steering Angle (°)", "yaw_rate": "Yaw Rate (°/s)", "distance_traveled": "Distance (m)"},
-        title="Yaw Response vs Steering Input",
-    )
-
-    for key in ["oversteer", "understeer"]:
-        if not bundle.events[key].any():
-            continue
-        style = EVENT_STYLES[key]
-        subset = data.loc[bundle.events[key]]
-        fig.add_trace(
-            go.Scatter(
-                x=subset["steering_angle"],
-                y=subset["yaw_rate"],
-                mode="markers",
-                name=style["label"],
-                marker=dict(color=style["color"], symbol=style["symbol"], size=9, line=dict(color="white", width=0.8)),
-            )
+    fig = go.Figure()
+    
+    # Add steering angle on left axis
+    fig.add_trace(
+        go.Scatter(
+            x=data["distance_traveled"],
+            y=data["steering_angle"],
+            mode="lines",
+            name="Steering Angle",
+            line=dict(color="#1f77b4", width=3),
+            yaxis="y1",
+            hovertemplate="Distance: %{x:.1f}m<br>Steering: %{y:.2f}°<extra></extra>",
         )
-
-    return style_figure(fig, "Yaw Response vs Steering - Distance Colored", "Steering Angle (°)", "Yaw Moment", height=420)
+    )
+    
+    # Add yaw rate on right axis
+    fig.add_trace(
+        go.Scatter(
+            x=data["distance_traveled"],
+            y=data["yaw_rate"],
+            mode="lines",
+            name="Yaw Rate",
+            line=dict(color="#ff7f0e", width=3),
+            yaxis="y2",
+            hovertemplate="Distance: %{x:.1f}m<br>Yaw Rate: %{y:.3f}°/s<extra></extra>",
+        )
+    )
+    
+    fig.update_layout(
+        template="plotly_white",
+        title=dict(text="Steering Angle & Yaw Rate vs Distance", font=dict(size=18, color="#1a1a1a")),
+        height=380,
+        margin=dict(l=60, r=100, t=70, b=80),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        hovermode="x unified",
+        font=dict(size=12),
+        xaxis=dict(
+            title=dict(text="Distance (m)", font=dict(size=14, color="#000000"), standoff=20),
+            showgrid=True,
+            gridcolor="rgba(200, 200, 200, 0.4)",
+            gridwidth=1,
+            dtick=10,
+            tickfont=dict(size=12, color="#333333"),
+            tickangle=-45,
+            showline=True,
+            linewidth=2,
+            linecolor="rgb(100, 100, 100)",
+            mirror=True
+        ),
+        yaxis=dict(
+            title=dict(text="Steering Angle (°)", font=dict(size=14, color="#000000"), standoff=20),
+            showgrid=True,
+            gridcolor="rgba(200, 200, 200, 0.25)",
+            gridwidth=1,
+            tickfont=dict(size=12, color="#333333"),
+            showline=True,
+            linewidth=2,
+            linecolor="rgb(100, 100, 100)",
+            mirror=True
+        ),
+        yaxis2=dict(
+            title=dict(text="Yaw Rate (°/s)", font=dict(size=14, color="#000000"), standoff=20),
+            overlaying="y",
+            side="right",
+            showgrid=False,
+            tickfont=dict(size=12, color="#333333"),
+            showline=True,
+            linewidth=2,
+            linecolor="rgb(100, 100, 100)",
+            mirror=True
+        ),
+    )
+    return fig
 
 
 def build_rpm_evolution_figure(bundle: AnalysisBundle) -> go.Figure:
     data = bundle.data
-    fig = px.scatter(
-        data,
-        x="distance_traveled",
-        y="rpm",
-        color="distance_traveled",
-        color_continuous_scale="Plasma",
-        labels={"rpm": "RPM", "distance_traveled": "Distance (m)"},
-        title="RPM Evolution Across Lap",
+    fig = go.Figure()
+    fig.add_trace(
+        go.Scatter(
+            x=data["distance_traveled"],
+            y=data["rpm"],
+            mode="lines",
+            name="RPM",
+            line=dict(color="#9467bd", width=3),
+            hovertemplate="Distance: %{x:.1f}m<br>RPM: %{y:.0f}<extra></extra>",
+        )
     )
+    
     fig.add_hrect(
         y0=bundle.thresholds["rpm_low"],
         y1=bundle.thresholds["rpm_high"],
@@ -881,23 +1019,9 @@ def build_rpm_evolution_figure(bundle: AnalysisBundle) -> go.Figure:
         annotation_text="Efficient RPM band",
         annotation_position="top left",
     )
-
-    for key in ["low_rpm_issue", "high_rpm_issue"]:
-        if not bundle.events[key].any():
-            continue
-        style = EVENT_STYLES[key]
-        subset = data.loc[bundle.events[key]]
-        fig.add_trace(
-            go.Scatter(
-                x=subset["distance_traveled"],
-                y=subset["rpm"],
-                mode="markers",
-                name=style["label"],
-                marker=dict(color=style["color"], symbol=style["symbol"], size=9, line=dict(width=0.8, color="white")),
-            )
-        )
-
-    return style_figure(fig, "RPM Evolution - Distance Colored", "Distance (m)", "RPM", height=420)
+    
+    fig = style_figure(fig, "RPM Evolution vs Distance", "Distance (m)", "RPM", height=380)
+    return fig
 
 
 def build_cornering_speed_figure(bundle: AnalysisBundle) -> Optional[go.Figure]:
@@ -910,17 +1034,19 @@ def build_cornering_speed_figure(bundle: AnalysisBundle) -> Optional[go.Figure]:
     if data.empty:
         return None
     
-    fig = px.scatter(
-        data,
-        x="distance_traveled",
-        y="cornering_speed",
-        color="cornering_speed",
-        color_continuous_scale="Viridis",
-        labels={"cornering_speed": "Speed (km/h)", "distance_traveled": "Distance (m)"},
-        title="Cornering Speed Profile",
+    fig = go.Figure()
+    fig.add_trace(
+        go.Scatter(
+            x=data["distance_traveled"],
+            y=data["cornering_speed"],
+            mode="lines",
+            name="Cornering Speed",
+            line=dict(color="#2ca02c", width=3),
+            hovertemplate="Distance: %{x:.1f}m<br>Speed: %{y:.1f}km/h<extra></extra>",
+        )
     )
     
-    return style_figure(fig, "Cornering Speed Across Lap", "Distance (m)", "Cornering Speed", height=380)
+    return style_figure(fig, "Cornering Speed Across Lap", "Distance (m)", "Cornering Speed (km/h)", height=380)
 
 
 def build_energy_efficient_figure(bundle: AnalysisBundle) -> Optional[go.Figure]:
@@ -933,18 +1059,19 @@ def build_energy_efficient_figure(bundle: AnalysisBundle) -> Optional[go.Figure]
     if data.empty:
         return None
     
-    fig = px.bar(
-        data.reset_index(drop=True),
-        x="distance_traveled",
-        y="energy_efficient",
-        color="energy_efficient",
-        color_continuous_scale="RdYlGn",
-        labels={"energy_efficient": "Efficiency Score", "distance_traveled": "Distance (m)"},
-        title="Energy Efficiency Timeline",
+    fig = go.Figure()
+    fig.add_trace(
+        go.Scatter(
+            x=data["distance_traveled"],
+            y=data["energy_efficient"],
+            mode="lines",
+            name="Energy Efficiency",
+            line=dict(color="#1f77b4", width=2),
+            hovertemplate="Distance: %{x:.1f}m<br>Efficiency: %{y:.1f}<extra></extra>",
+        )
     )
-    fig.update_traces(marker_line_width=0)
     
-    return style_figure(fig, "Energy Efficiency - Distance Based", "Distance (m)", "Efficiency Score", height=380)
+    return style_figure(fig, "Energy Efficiency vs Distance", "Distance (m)", "Efficiency Score", height=380)
 
 
 def build_track_map_figure(
@@ -1001,7 +1128,7 @@ def build_track_map_figure(
         )
     )
 
-    for key in ["oversteer", "understeer", "wheel_spin", "unstable"]:
+    for key in ["oversteer", "understeer", "wheel_spin"]:
         if not bundle.events[key].any():
             continue
         style = EVENT_STYLES[key]
@@ -1034,17 +1161,35 @@ def build_track_map_figure(
 
 def render_summary_metrics(bundle: AnalysisBundle) -> None:
     stats_columns = st.columns(4)
-    stats_columns[0].metric("Lap Time", f"{bundle.lap_time:.2f}s")
-    stats_columns[1].metric("Total Distance", f"{bundle.stats.get('lap_distance', 0):.0f}m")
-    stats_columns[2].metric("Average Speed", f"{bundle.stats['average_speed']:.1f} km/h")
-    stats_columns[3].metric("Top Speed", f"{bundle.stats['top_speed']:.1f} km/h")
+    
+    # Explicit type conversion and validation  
+    lap_time_val = float(bundle.lap_time) if bundle.lap_time is not None else 0.0
+    lap_distance_val = float(bundle.stats.get('lap_distance', 0)) if bundle.stats.get('lap_distance') is not None else 0.0
+    avg_speed_val = float(bundle.stats.get('average_speed', 0)) if bundle.stats.get('average_speed') is not None else 0.0
+    top_speed_val = float(bundle.stats.get('top_speed', 0)) if bundle.stats.get('top_speed') is not None else 0.0
+    
+    # DEBUG: Log values
+    with st.empty():
+        pass  # Hidden debug container
+    
+    stats_columns[0].metric("Lap Time", f"{lap_time_val:.2f}s")
+    stats_columns[1].metric("Total Distance", f"{lap_distance_val:.0f}m")
+    stats_columns[2].metric("Average Speed", f"{avg_speed_val:.1f} km/h")
+    stats_columns[3].metric("Top Speed", f"{top_speed_val:.1f} km/h")
+    
+    # Show debug info in expander for troubleshooting
+    with st.expander("🔧 Debug Info"):
+        st.write(f"**Bundle lap_time (raw):** {bundle.lap_time}")
+        st.write(f"**Bundle stats:** {bundle.stats}")
+        st.write(f"**Lap time calculated value:** {lap_time_val}")
+        st.write(f"**Distance calculated value:** {lap_distance_val}")
 
     event_columns = st.columns(5)
     event_columns[0].metric("Oversteer", bundle.event_counts["oversteer"])
     event_columns[1].metric("Understeer", bundle.event_counts["understeer"])
     event_columns[2].metric("Harsh Braking", bundle.event_counts["harsh_braking"])
     event_columns[3].metric("Traction Loss", bundle.event_counts["wheel_spin"])
-    event_columns[4].metric("Instability", bundle.event_counts["unstable"])
+    # Instability metric removed - use oversteer/understeer counts instead
 
 
 def render_insights(bundle: AnalysisBundle) -> None:
@@ -1123,16 +1268,26 @@ def render_overview(bundle: AnalysisBundle) -> None:
 
 
 def render_charts(bundle: AnalysisBundle) -> None:
+    # Top row: Speed and Throttle/Brake
     chart_col_1, chart_col_2 = st.columns(2)
     with chart_col_1:
         st.plotly_chart(build_speed_figure(bundle), use_container_width=True)
-        st.plotly_chart(build_slip_figure(bundle), use_container_width=True)
     with chart_col_2:
         st.plotly_chart(build_controls_figure(bundle), use_container_width=True)
+    
+    # Second row: Slip and Lateral Accel
+    chart_col_1, chart_col_2 = st.columns(2)
+    with chart_col_1:
+        st.plotly_chart(build_slip_figure(bundle), use_container_width=True)
+    with chart_col_2:
         st.plotly_chart(build_lateral_accel_figure(bundle), use_container_width=True)
-
-    st.plotly_chart(build_yaw_vs_steering_figure(bundle), use_container_width=True)
-    st.plotly_chart(build_rpm_evolution_figure(bundle), use_container_width=True)
+    
+    # Third row: Steering & Yaw and RPM
+    chart_col_1, chart_col_2 = st.columns(2)
+    with chart_col_1:
+        st.plotly_chart(build_steering_yaw_figure(bundle), use_container_width=True)
+    with chart_col_2:
+        st.plotly_chart(build_rpm_evolution_figure(bundle), use_container_width=True)
     
     # Optional: Cornering speed visualization
     cornering_fig = build_cornering_speed_figure(bundle)
@@ -1209,14 +1364,14 @@ def render_comparison(primary: AnalysisBundle, comparison: AnalysisBundle) -> No
     comparison_col_1, comparison_col_2 = st.columns(2)
     with comparison_col_1:
         fig = go.Figure()
-        fig.add_trace(go.Scatter(x=primary.data["distance_traveled"], y=primary.data["speed"], name=primary.name))
-        fig.add_trace(go.Scatter(x=comparison.data["distance_traveled"], y=comparison.data["speed"], name=comparison.name))
+        fig.add_trace(go.Scatter(x=primary.data["distance_traveled"], y=primary.data["speed"], name=primary.name, mode="lines", line=dict(width=2)))
+        fig.add_trace(go.Scatter(x=comparison.data["distance_traveled"], y=comparison.data["speed"], name=comparison.name, mode="lines", line=dict(width=2)))
         fig = style_figure(fig, "Speed Trace Comparison (Distance-Based)", "Distance (m)", "Speed (km/h)")
         st.plotly_chart(fig, use_container_width=True)
     with comparison_col_2:
         fig = go.Figure()
-        fig.add_trace(go.Scatter(x=primary.data["distance_traveled"], y=primary.data["slip_severity"], name=primary.name))
-        fig.add_trace(go.Scatter(x=comparison.data["distance_traveled"], y=comparison.data["slip_severity"], name=comparison.name))
+        fig.add_trace(go.Scatter(x=primary.data["distance_traveled"], y=primary.data["slip_severity"], name=primary.name, mode="lines", line=dict(width=2)))
+        fig.add_trace(go.Scatter(x=comparison.data["distance_traveled"], y=comparison.data["slip_severity"], name=comparison.name, mode="lines", line=dict(width=2)))
         fig = style_figure(fig, "Slip Angle Comparison (Distance-Based)", "Distance (m)", "Slip Angle (°)")
         st.plotly_chart(fig, use_container_width=True)
 
@@ -1253,8 +1408,12 @@ def main() -> None:
     try:
         with st.spinner("Analyzing handling dynamics..."):
             primary_bundle = analyze_uploaded_file(primary_upload)
+            # Debug output
+            st.success(f"✅ Analysis complete: {primary_bundle.lap_time:.2f}s lap, {primary_bundle.stats['lap_distance']:.1f}m distance")
     except Exception as exc:
         st.error(f"❌ Analysis failed: {exc}")
+        import traceback
+        st.error(traceback.format_exc())
         return
 
     comparison_bundle = None
