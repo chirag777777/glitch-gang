@@ -40,7 +40,10 @@ try:
         create_telemetry_dashboard,
         create_lap_delta_graph,
         create_driver_style_radar,
-        create_performance_timeline
+        create_performance_timeline,
+        create_antigravity_track_map,
+        create_car_performance_track,
+        create_g_force_map
     )
     RACING_UI_AVAILABLE = True
 except ImportError:
@@ -223,16 +226,60 @@ def render_driver_rating(df: pd.DataFrame):
 
 
 def render_track_visualization(df: pd.DataFrame):
-    """Render track map"""
+    """Render various track visualization modes"""
     
     if not RACING_UI_AVAILABLE:
         st.warning("Racing UI unavailable")
         return
     
-    st.plotly_chart(
-        create_track_map(df, has_gps='latitude' in df.columns),
-        use_container_width=True
-    )
+    st.markdown("### 🗺️ Track Visualization Modes")
+    
+    # Create tabs for different visualization types
+    tab1, tab2, tab3, tab4, tab5 = st.tabs([
+        "🏁 Standard Track", 
+        "🚀 Anti-Gravity 3D",
+        "🏎️ Racing Performance",
+        "⚡ G-Force Intensity",
+        "🔥 Corner Heatmap"
+    ])
+    
+    with tab1:
+        st.markdown("**Standard Distance-Based Track Map**")
+        st.plotly_chart(
+            create_track_map(df, has_gps='latitude' in df.columns),
+            use_container_width=True
+        )
+    
+    with tab2:
+        st.markdown("**Anti-Gravity 3D Visualization**")
+        st.info("🚀 3D track with G-forces shown as elevation. Grab and rotate to explore!")
+        st.plotly_chart(
+            create_antigravity_track_map(df),
+            use_container_width=True
+        )
+    
+    with tab3:
+        st.markdown("**Racing Performance Track**")
+        st.info("🏎️ Shows acceleration (green ▲), braking (red ▼), and cornering (magenta ◆) zones")
+        st.plotly_chart(
+            create_car_performance_track(df),
+            use_container_width=True
+        )
+    
+    with tab4:
+        st.markdown("**G-Force Intensity Map**")
+        st.info("⚡ Red intensity shows G-forces, yellow circles mark extreme zones (>2.0G)")
+        st.plotly_chart(
+            create_g_force_map(df),
+            use_container_width=True
+        )
+    
+    with tab5:
+        st.markdown("**Corner Intensity Heatmap**")
+        st.plotly_chart(
+            create_corner_heatmap(df),
+            use_container_width=True
+        )
 
 
 def render_driver_style_profile(df: pd.DataFrame):

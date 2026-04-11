@@ -140,29 +140,101 @@ def create_track_map(df: pd.DataFrame, has_gps: bool = False) -> go.Figure:
             mapbox_style='carto-positron'
         )
     else:
-        # Distance-based track
+        # Distance-based synthetic track generation
         fig = go.Figure()
         
-        # Create 2D track projection from distance
         df_sorted = df.sort_values('distance_traveled' if 'distance_traveled' in df.columns else 'time')
         distance = df_sorted['distance_traveled'].values if 'distance_traveled' in df.columns else df_sorted['time'].values
         
-        # Create synthetic X-Y based on steering
+        # Multi-signal synthetic track projection (better than simple steering)
         steering = df_sorted['steering_angle'].values if 'steering_angle' in df.columns else np.zeros(len(df_sorted))
-        x_pos = np.cumsum(np.cos(np.radians(steering)) * 0.1)
-        y_pos = np.cumsum(np.sin(np.radians(steering)) * 0.1)
+        throttle = df_sorted['throttle_input'].values if 'throttle_input' in df.columns else np.zeros(len(df_sorted))
+        brake = df_sorted['brake_input'].values if 'brake_input' in df.columns else np.zeros(len(df_sorted))
+        speed = df_sorted['speed'].values if 'speed' in df.columns else np.ones(len(df_sorted)) * 100
         
-        speed_color = df_sorted['speed'].values
+        # Create more realistic track using steering, throttle, brake inputs
+        x_pos = np.zeros(len(df_sorted))
+        y_pos = np.zeros(len(df_sorted))
+        angle = 0
         
+        for i in range(1, len(df_sorted)):
+            # Steering input curves the track
+            angle += steering.iloc[i] if hasattr(steering, 'iloc') else steering[i]
+            angle = angle % 360
+            
+            # Speed affects segment length
+            segment_length = (speed.iloc[i] if hasattr(speed, 'iloc') else speed[i]) / 100 * 0.2
+            
+            # Add acceleration/braking depth
+            depth_factor = 1 + (throttle.iloc[i] if hasattr(throttle, 'iloc') else throttle[i]) * 0.3
+            
+            x_pos[i] = x_pos[i-1] + np.cos(np.radians(angle)) * segment_length * depth_factor
+            y_pos[i] = y_pos[i-1] + np.sin(np.radians(angle)) * segment_length * depth_factor
+        
+        speed_color = speed
+        
+        # Track line
         fig.add_trace(go.Scatter(
             x=x_pos,
             y=y_pos,
-            mode='lines+markers',
-            line=dict(color=speed_color, colorscale='Viridis', width=3),
-            marker=dict(size=6, color=speed_color, colorscale='Viridis', showscale=True),
-            hovertext=[f"Dist: {d:.1f}m<br>Speed: {s:.1f}km/h" for d, s in zip(distance, speed_color)],
+            mode='lines',
+            line=dict(color=speed_color, colorscale='Plasma', width=6, 
+                     colorbar=dict(title='Speed (km/h)', thickness=15, len=0.7)),
+            hovertext=[f"Dist: {d:.1f}m<br>Speed: {s:.1f}km/h<br>Steering: {st:.1f}°" 
+                      for d, s, st in zip(distance, speed_color, steering)],
             hoverinfo='text',
-            name='Track'
+            name='Track Line'
+        ))
+        
+        # Add cornering points
+        corner_mask = (np.abs(steering) > 10)
+        if corner_mask.any():
+            fig.add_trace(go.Scatter(
+                x=x_pos[corner_mask],
+                y=y_pos[corner_mask],
+                mode='markers',
+                marker=dict(size=8, color='#FF00FF', symbol='diamond', 
+                           line=dict(color='white', width=2)),
+                name='Corners',
+                hovertext='🔄 Corner Zone',
+                hoverinfo='text'
+            ))
+        
+        # Add straights
+        straight_mask = (np.abs(steering) <= 5)
+        if straight_mask.any():
+            fig.add_trace(go.Scatter(
+                x=x_pos[straight_mask],
+                y=y_pos[straight_mask],
+                mode='markers',
+                marker=dict(size=4, color='#00FF00', symbol='circle', opacity=0.6),
+                name='Straights',
+                hovertext='➡️ Straight Zone',
+                hoverinfo='text'
+            ))
+        
+        # Start point
+        fig.add_trace(go.Scatter(
+            x=[x_pos[0]], y=[y_pos[0]],
+            mode='markers+text',
+            marker=dict(size=15, color='#00FF00', symbol='star'),
+            text=['START'],
+            textposition='top center',
+            name='Start',
+            hovertext='🏁 Start/Finish',
+            hoverinfo='text'
+        ))
+        
+        # End point
+        fig.add_trace(go.Scatter(
+            x=[x_pos[-1]], y=[y_pos[-1]],
+            mode='markers+text',
+            marker=dict(size=15, color='#FF0000', symbol='star'),
+            text=['END'],
+            textposition='top center',
+            name='Finish',
+            hovertext='🏁 Finish',
+            hoverinfo='text'
         ))
     
     # Styling
@@ -373,6 +445,335 @@ def create_driver_style_radar(driver_style: Dict[str, float]) -> go.Figure:
         plot_bgcolor='rgba(20, 20, 30, 1)',
         paper_bgcolor='rgba(20, 20, 30, 1)',
         height=400
+    )
+    
+    return fig
+
+
+# ============================================================================
+# ANTI-GRAVITY VISUALIZATION
+# ============================================================================
+
+def create_antigravity_track_map(df: pd.DataFrame) -> go.Figure:
+    """
+    Create an anti-gravity style visualization with 3D-like effects
+    Shows acceleration, braking, and cornering forces as vertical displacement
+    """
+    
+    df_sorted = df.sort_values('distance_traveled' if 'distance_traveled' in df.columns else 'time')
+    distance = df_sorted['distance_traveled'].values if 'distance_traveled' in df.columns else df_sorted['time'].values
+    
+    # Generate base track
+    steering = df_sorted['steering_angle'].values if 'steering_angle' in df_sorted.columns else np.zeros(len(df_sorted))
+    speed = df_sorted['speed'].values if 'speed' in df_sorted.columns else np.ones(len(df_sorted)) * 100
+    
+    x_pos = np.zeros(len(df_sorted))
+    y_pos = np.zeros(len(df_sorted))
+    angle = 0
+    
+    for i in range(1, len(df_sorted)):
+        angle += steering[i]
+        angle = angle % 360
+        segment_length = (speed[i] / 100) * 0.2
+        x_pos[i] = x_pos[i-1] + np.cos(np.radians(angle)) * segment_length
+        y_pos[i] = y_pos[i-1] + np.sin(np.radians(angle)) * segment_length
+    
+    # Calculate G-forces for vertical displacement (anti-gravity effect)
+    if 'lateral_g_force' in df_sorted.columns:
+        g_force = np.abs(df_sorted['lateral_g_force'].values)
+    else:
+        # Estimate from steering and speed
+        g_force = (np.abs(steering) / 45) * (speed / 200) * 3
+    
+    # Normalize for visualization
+    z_pos = (g_force - g_force.min()) / (g_force.max() - g_force.min() + 0.001) * 100
+    
+    fig = go.Figure()
+    
+    # Anti-gravity track surface
+    fig.add_trace(go.Scatter3d(
+        x=x_pos,
+        y=y_pos,
+        z=z_pos,
+        mode='lines+markers',
+        line=dict(
+            color=speed,
+            colorscale='Hot',
+            width=8,
+            colorbar=dict(title='Speed', x=0.85, len=0.7)
+        ),
+        marker=dict(
+            size=5,
+            color=g_force,
+            colorscale='Plasma',
+            showscale=False
+        ),
+        hovertext=[f"<b>Distance:</b> {d:.0f}m<br><b>Speed:</b> {s:.1f}km/h<br><b>G-Force:</b> {g:.2f}G" 
+                  for d, s, g in zip(distance, speed, g_force)],
+        hoverinfo='text',
+        name='Anti-Gravity Track'
+    ))
+    
+    # Start point
+    fig.add_trace(go.Scatter3d(
+        x=[x_pos[0]], y=[y_pos[0]], z=[z_pos[0]],
+        mode='markers+text',
+        marker=dict(size=12, color='lime', symbol='star'),
+        text=['START'],
+        name='Start',
+        hovertext='🏁 START'
+    ))
+    
+    # End point  
+    fig.add_trace(go.Scatter3d(
+        x=[x_pos[-1]], y=[y_pos[-1]], z=[z_pos[-1]],
+        mode='markers+text',
+        marker=dict(size=12, color='red', symbol='star'),
+        text=['FINISH'],
+        name='Finish',
+        hovertext='🏁 FINISH'
+    ))
+    
+    fig.update_layout(
+        title='🚀 ANTI-GRAVITY TRACK MAP (3D)',
+        scene=dict(
+            xaxis=dict(title='X Position', backgroundcolor='rgb(20, 20, 30)', gridcolor='rgb(50, 50, 80)'),
+            yaxis=dict(title='Y Position', backgroundcolor='rgb(20, 20, 30)', gridcolor='rgb(50, 50, 80)'),
+            zaxis=dict(title='G-Force Level', backgroundcolor='rgb(20, 20, 30)', gridcolor='rgb(50, 50, 80)'),
+            bgcolor='rgba(20, 20, 30, 0.95)'
+        ),
+        font=dict(color='white', family='Arial Black', size=12),
+        paper_bgcolor='rgba(20, 20, 30, 1)',
+        height=600,
+        hovermode='closest'
+    )
+    
+    return fig
+
+
+# ============================================================================
+# CAR RACING VISUALIZATION
+# ============================================================================
+
+def create_car_performance_track(df: pd.DataFrame) -> go.Figure:
+    """
+    Create a racing visualization with car position and performance metrics
+    """
+    
+    df_sorted = df.sort_values('distance_traveled' if 'distance_traveled' in df.columns else 'time')
+    distance = df_sorted['distance_traveled'].values if 'distance_traveled' in df_sorted.columns else df_sorted['time'].values
+    
+    # Generate track
+    steering = df_sorted['steering_angle'].values if 'steering_angle' in df_sorted.columns else np.zeros(len(df_sorted))
+    speed = df_sorted['speed'].values if 'speed' in df_sorted.columns else np.ones(len(df_sorted)) * 100
+    throttle = df_sorted['throttle_input'].values if 'throttle_input' in df_sorted.columns else np.zeros(len(df_sorted))
+    brake = df_sorted['brake_input'].values if 'brake_input' in df_sorted.columns else np.zeros(len(df_sorted))
+    
+    x_pos = np.zeros(len(df_sorted))
+    y_pos = np.zeros(len(df_sorted))
+    angle = 0
+    
+    for i in range(1, len(df_sorted)):
+        angle += steering[i]
+        angle = angle % 360
+        segment_length = (speed[i] / 100) * 0.2
+        x_pos[i] = x_pos[i-1] + np.cos(np.radians(angle)) * segment_length
+        y_pos[i] = y_pos[i-1] + np.sin(np.radians(angle)) * segment_length
+    
+    fig = go.Figure()
+    
+    # Main track line with speed coloring
+    fig.add_trace(go.Scatter(
+        x=x_pos,
+        y=y_pos,
+        mode='lines',
+        line=dict(
+            color=speed,
+            colorscale='Turbo',
+            width=5,
+            colorbar=dict(title='Speed km/h', thickness=15)
+        ),
+        hovertext=[f"Speed: {s:.1f}km/h<br>Throttle: {t*100:.0f}%<br>Brake: {b*100:.0f}%<br>Distance: {d:.0f}m" 
+                  for s, t, b, d in zip(speed, throttle, brake, distance)],
+        hoverinfo='text',
+        name='Racing Line'
+    ))
+    
+    # Acceleration zones (high throttle)
+    accel_mask = throttle > 0.7
+    if accel_mask.any():
+        fig.add_trace(go.Scatter(
+            x=x_pos[accel_mask],
+            y=y_pos[accel_mask],
+            mode='markers',
+            marker=dict(size=8, color='lime', symbol='triangle-up', opacity=0.7),
+            name='🚀 Acceleration',
+            hovertext='Accelerating'
+        ))
+    
+    # Braking zones (high brake)
+    brake_mask = brake > 0.7
+    if brake_mask.any():
+        fig.add_trace(go.Scatter(
+            x=x_pos[brake_mask],
+            y=y_pos[brake_mask],
+            mode='markers',
+            marker=dict(size=8, color='red', symbol='triangle-down', opacity=0.7),
+            name='🔴 Braking',
+            hovertext='Braking Hard'
+        ))
+    
+    # Cornering zones (high steering)
+    corner_mask = np.abs(steering) > 15
+    if corner_mask.any():
+        fig.add_trace(go.Scatter(
+            x=x_pos[corner_mask],
+            y=y_pos[corner_mask],
+            mode='markers',
+            marker=dict(size=8, color='#FF00FF', symbol='diamond', opacity=0.7, 
+                       line=dict(color='white', width=1)),
+            name='🔄 Cornering',
+            hovertext='Hard Corner'
+        ))
+    
+    # Car position markers at key points (every 100 distance units)
+    sample_rate = max(1, len(df_sorted) // 20)
+    sample_indices = np.arange(0, len(df_sorted), sample_rate)
+    
+    fig.add_trace(go.Scatter(
+        x=x_pos[sample_indices],
+        y=y_pos[sample_indices],
+        mode='markers',
+        marker=dict(
+            size=10,
+            color=speed[sample_indices],
+            colorscale='Plasma',
+            symbol='circle',
+            line=dict(color='yellow', width=2)
+        ),
+        name='🏎️ Car Positions',
+        hovertext=[f"Distance: {distance[i]:.0f}m<br>Speed: {speed[i]:.1f}km/h" 
+                  for i in sample_indices],
+        hoverinfo='text'
+    ))
+    
+    # Start/Finish
+    fig.add_trace(go.Scatter(
+        x=[x_pos[0]], y=[y_pos[0]],
+        mode='markers', marker=dict(size=20, color='lime', symbol='star'),
+        name='🏁 START'
+    ))
+    
+    fig.add_trace(go.Scatter(
+        x=[x_pos[-1]], y=[y_pos[-1]],
+        mode='markers', marker=dict(size=20, color='red', symbol='star'),
+        name='🏁 FINISH'
+    ))
+    
+    fig.update_layout(
+        title='🏎️ RACING PERFORMANCE MAP',
+        xaxis_title='Track X Position',
+        yaxis_title='Track Y Position',
+        plot_bgcolor='rgba(20, 30, 45, 1)',
+        paper_bgcolor='rgba(20, 20, 30, 1)',
+        font=dict(color='white', size=12),
+        height=600,
+        hovermode='closest',
+        showlegend=True
+    )
+    
+    fig.update_xaxes(showgrid=True, gridwidth=1, gridcolor='rgba(100, 100, 150, 0.2)')
+    fig.update_yaxes(showgrid=True, gridwidth=1, gridcolor='rgba(100, 100, 150, 0.2)')
+    
+    return fig
+
+
+# ============================================================================
+# FORCE VISUALIZATION (G-FORCES IN 2D)
+# ============================================================================
+
+def create_g_force_map(df: pd.DataFrame) -> go.Figure:
+    """
+    Create a 2D map showing G-forces at each point on track
+    """
+    
+    df_sorted = df.sort_values('distance_traveled' if 'distance_traveled' in df.columns else 'time')
+    distance = df_sorted['distance_traveled'].values if 'distance_traveled' in df_sorted.columns else df_sorted['time'].values
+    
+    # Generate track
+    steering = df_sorted['steering_angle'].values if 'steering_angle' in df_sorted.columns else np.zeros(len(df_sorted))
+    speed = df_sorted['speed'].values if 'speed' in df_sorted.columns else np.ones(len(df_sorted)) * 100
+    
+    x_pos = np.zeros(len(df_sorted))
+    y_pos = np.zeros(len(df_sorted))
+    angle = 0
+    
+    for i in range(1, len(df_sorted)):
+        angle += steering[i]
+        angle = angle % 360
+        segment_length = (speed[i] / 100) * 0.2
+        x_pos[i] = x_pos[i-1] + np.cos(np.radians(angle)) * segment_length
+        y_pos[i] = y_pos[i-1] + np.sin(np.radians(angle)) * segment_length
+    
+    # Calculate G-forces
+    if 'lateral_g_force' in df_sorted.columns:
+        lateral_g = df_sorted['lateral_g_force'].values
+    else:
+        lateral_g = (np.abs(steering) / 45) * (speed / 200) * 3
+    
+    if 'longitudinal_g_force' in df_sorted.columns:
+        long_g = df_sorted['longitudinal_g_force'].values
+    else:
+        long_g = np.zeros(len(df_sorted))
+    
+    total_g = np.sqrt(lateral_g**2 + long_g**2)
+    
+    fig = go.Figure()
+    
+    # Track with G-force coloring
+    fig.add_trace(go.Scatter(
+        x=x_pos,
+        y=y_pos,
+        mode='lines+markers',
+        line=dict(
+            color=total_g,
+            colorscale='Reds',
+            width=6,
+            colorbar=dict(title='Total G-Force', thickness=15)
+        ),
+        marker=dict(
+            size=5,
+            color=total_g,
+            colorscale='Reds',
+            showscale=False
+        ),
+        hovertext=[f"<b>G-Force:</b> {g:.2f}G<br><b>Lateral:</b> {lg:.2f}G<br><b>Speed:</b> {s:.1f}km/h<br><b>Distance:</b> {d:.0f}m" 
+                  for g, lg, s, d in zip(total_g, lateral_g, speed, distance)],
+        hoverinfo='text',
+        name='G-Force Map'
+    ))
+    
+    # High G-force warning zones (>2G)
+    high_g_mask = total_g > 2.0
+    if high_g_mask.any():
+        fig.add_trace(go.Scatter(
+            x=x_pos[high_g_mask],
+            y=y_pos[high_g_mask],
+            mode='markers',
+            marker=dict(size=10, color='yellow', symbol='circle', 
+                       line=dict(color='red', width=3), opacity=0.8),
+            name='⚡ High G-Force Zone (>2.0G)',
+            hovertext='⚠️ Extreme G-Forces'
+        ))
+    
+    fig.update_layout(
+        title='⚡ G-FORCE INTENSITY MAP',
+        xaxis_title='Track X Position',
+        yaxis_title='Track Y Position',
+        plot_bgcolor='rgba(20, 30, 45, 1)',
+        paper_bgcolor='rgba(20, 20, 30, 1)',
+        font=dict(color='white', size=12),
+        height=600
     )
     
     return fig
