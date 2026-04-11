@@ -184,8 +184,11 @@ def find_optimal_clusters(X: np.ndarray, max_k: int = 10) -> int:
     if len(X) < 2:
         return 1
     
-    if len(X) < max_k:
-        max_k = max(2, min(len(X) - 1, 3))  # Cap at reasonable range for small data
+    # For small datasets, use more conservative max_k
+    if len(X) < 10:
+        max_k = min(2, len(X) - 1)  # Max 2 clusters for very small data
+    elif len(X) < max_k:
+        max_k = min(len(X) - 1, 5)  # Cap at reasonable range
     
     # If we can't form 2 clusters, return 1
     if max_k < 2:
@@ -194,20 +197,32 @@ def find_optimal_clusters(X: np.ndarray, max_k: int = 10) -> int:
     try:
         silhouette_scores = []
         db_scores = []
+        valid_k_values = []
         
         for k in range(2, max_k + 1):
             try:
+                # Skip silhouette/db scores for very small k values to avoid numerical issues
                 kmeans = KMeans(n_clusters=k, random_state=42, n_init=10)
                 labels = kmeans.fit_predict(X)
                 
-                sil_score = silhouette_score(X, labels)
-                db_score = davies_bouldin_score(X, labels)
-                
-                silhouette_scores.append(sil_score)
-                db_scores.append(db_score)
+                # Only compute scoring metrics if we have enough samples
+                if len(np.unique(labels)) >= 2 and len(X) >= max(2, k):
+                    try:
+                        sil_score = silhouette_score(X, labels)
+                        db_score = davies_bouldin_score(X, labels)
+                        silhouette_scores.append(sil_score)
+                        db_scores.append(db_score)
+                        valid_k_values.append(k)
+                    except Exception:
+                        # If scoring fails, still count as valid k for later fallback
+                        valid_k_values.append(k)
             except Exception:
                 # Skip this k if clustering fails
                 continue
+        
+        # If no valid scores calculated, use first valid k
+        if not silhouette_scores and valid_k_values:
+            return min(valid_k_values[0], len(X))
         
         # If no valid clusters found, return 1
         if not silhouette_scores:
@@ -218,7 +233,7 @@ def find_optimal_clusters(X: np.ndarray, max_k: int = 10) -> int:
         normalized_db = 1 - (np.array(db_scores) / (max(db_scores) + 1e-6))
         
         combined_scores = 0.6 * normalized_sil + 0.4 * normalized_db
-        optimal_k = np.argmax(combined_scores) + 2
+        optimal_k = valid_k_values[np.argmax(combined_scores)]
         
         return min(int(optimal_k), len(X))  # Can't have more clusters than samples
     except Exception:

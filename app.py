@@ -1,5 +1,5 @@
 """
-Driver Telemetry Analysis System - Handling Dynamics Focus
+Automated Motorsports Telemetry Analysis System (AMTAS)
 Analyzes race telemetry data against DISTANCE (not time) for vehicle dynamics insights.
 Provides corner-by-corner handling analysis with driver technique and suspension recommendations.
 """
@@ -16,12 +16,26 @@ import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 
+# Set random seed for reproducible results across runs
+np.random.seed(42)
+pd.set_option('mode.copy_on_write', True)
+
 # ML Module imports
 try:
     from ml_module import run_ml_pipeline
     ML_AVAILABLE = True
 except ImportError:
     ML_AVAILABLE = False
+
+# Advanced Features imports
+try:
+    from advanced_features import (
+        SessionHistory, AdvancedComparison, HeatmapGenerator,
+        AlertSystem, PerformanceTracker, ExportManager, AdaptiveCoaching
+    )
+    ADVANCED_FEATURES_AVAILABLE = True
+except ImportError:
+    ADVANCED_FEATURES_AVAILABLE = False
 
 
 REQUIRED_COLUMNS = [
@@ -41,7 +55,7 @@ EVENT_STYLES = {
     "harsh_braking": {"label": "Harsh Braking", "color": "#9467bd", "symbol": "triangle-down"},
     "late_braking": {"label": "Late Braking", "color": "#8c564b", "symbol": "triangle-left"},
     "early_braking": {"label": "Early Braking", "color": "#17becf", "symbol": "triangle-right"},
-    "wheel_spin": {"label": "Traction Loss", "color": "#e377c2", "symbol": "star"},
+    "wheel_spin": {"label": "Longitudinal Wheel Slide", "color": "#e377c2", "symbol": "star"},
     "low_rpm_issue": {"label": "Low RPM", "color": "#2ca02c", "symbol": "square"},
     "high_rpm_issue": {"label": "High RPM", "color": "#bcbd22", "symbol": "hexagon"},
 }
@@ -62,6 +76,7 @@ class AnalysisBundle:
     stats: Dict[str, float]
     sector_summary: Optional[pd.DataFrame] = None  # Sector-based analysis (if sector data available)
     ml_results: Optional[Dict] = None  # ML pipeline results (if available)
+    quality_report: Optional[object] = None  # Data quality report (if available)
 
 
 def clip_0_100(value: float) -> float:
@@ -206,6 +221,9 @@ def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
     data["yaw_abs"] = data["yaw_rate"].abs()  # Fixed: was yaw_moment
     data["acceleration"] = data["speed"].diff().fillna(0) / data["dt"].replace(0, np.nan)
     data["acceleration"] = data["acceleration"].replace([np.inf, -np.inf], 0).fillna(0)
+    # Slip angle estimation: Combines steering input and yaw rate to estimate vehicle slip angle
+    # True slip angle = arctan(lateral_velocity / longitudinal_velocity) but we approximate using steering + yaw
+    # This represents the angle between vehicle heading and direction of travel
     data["slip_severity"] = data["steering_abs"] + (data["yaw_abs"] * 0.5)  # Slip estimated from steering + yaw
     data["input_change"] = (
         data["throttle_input"].diff().fillna(0).abs()
@@ -233,12 +251,24 @@ def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
 def compute_thresholds(data: pd.DataFrame) -> Dict[str, float]:
     # Adaptive corner threshold: if max steering is low, use lower threshold
     steering_max = float(data["steering_abs"].max())
-    if steering_max < 3.0:
-        # Data has very small steering angles, use adaptive threshold
-        corner_threshold = float(max(0.5, safe_quantile(data["steering_abs"], 0.65, 1.0)))
+    steering_mean = float(data["steering_abs"].mean())
+    
+    # More adaptive threshold based on steering distribution
+    if steering_max < 0.5:
+        # Extremely minimal steering - detect even tiny movements
+        corner_threshold = float(max(0.2, safe_quantile(data["steering_abs"], 0.50, 0.3)))
+    elif steering_max < 1.0:
+        # Very minimal steering angles
+        corner_threshold = float(max(0.3, safe_quantile(data["steering_abs"], 0.55, 0.5)))
+    elif steering_max < 3.0:
+        # Small steering angles
+        corner_threshold = float(max(0.5, safe_quantile(data["steering_abs"], 0.60, 1.0)))
+    elif steering_max < 10.0:
+        # Moderate steering
+        corner_threshold = float(max(2.0, safe_quantile(data["steering_abs"], 0.65, 3.0)))
     else:
-        # Data has significant steering, use standard threshold
-        corner_threshold = float(max(5.0, safe_quantile(data["steering_abs"], 0.65, 6.0)))
+        # Large steering angles
+        corner_threshold = float(max(5.0, safe_quantile(data["steering_abs"], 0.70, 6.0)))
     
     return {
         "brake_threshold": float(np.clip(max(0.20, safe_quantile(data["brake_input"], 0.70, 0.25)), 0.20, 0.55)),
@@ -267,6 +297,34 @@ def add_zone_columns(data: pd.DataFrame, thresholds: Dict[str, float]) -> pd.Dat
     df["corner_zone"] = df["steering_abs"] > thresholds["corner_threshold"]
     df["corner_id"] = segment_ids_from_mask(df["corner_zone"])
     return df
+
+
+def detect_corner_phases(data: pd.DataFrame) -> pd.Series:
+    """
+    Detect corner phases: ENTRY, APEX (MID), EXIT for each turn.
+    Returns a Series with phase classification for each row.
+    """
+    phases = pd.Series("STRAIGHT", index=data.index)
+    
+    for turn_id in sorted(data[data["corner_id"] > 0]["corner_id"].unique()):
+        turn_section = data[data["corner_id"] == turn_id]
+        if turn_section.empty:
+            continue
+        
+        turn_idx = turn_section.index
+        start_idx = turn_idx.min()
+        end_idx = turn_idx.max()
+        turn_length = end_idx - start_idx + 1
+        
+        # Divide turn into three equal parts
+        entry_end = start_idx + turn_length // 3
+        exit_start = start_idx + 2 * (turn_length // 3)
+        
+        phases.iloc[start_idx:entry_end] = "ENTRY"
+        phases.iloc[entry_end:exit_start] = "MID"
+        phases.iloc[exit_start:end_idx+1] = "EXIT"
+    
+    return phases
 
 
 def analyze_braking_timing(data: pd.DataFrame) -> Dict[str, pd.Series]:
@@ -346,11 +404,13 @@ def detect_events(data: pd.DataFrame, thresholds: Dict[str, float]) -> Dict[str,
         traction_loss
         & (data["yaw_abs"] > thresholds["yaw_high"])
     )
-    # Understeer: SUBSET of traction loss with low yaw response
+    # Understeer: SUBSET of traction loss with low yaw response (MUTUALLY EXCLUSIVE from oversteer)
     # Understeer is when the front loses grip (insufficient yaw)
+    # Important: understeer excludes oversteer to avoid dual reporting of same event
     understeer = (
         traction_loss
         & (data["yaw_response"] < thresholds["yaw_response_low"])
+        & ~oversteer  # Explicitly exclude oversteer cases
     )
     # Note: These are explicit subsets. Some traction_loss events may be neither oversteer nor understeer.
     harsh_braking = (
@@ -461,10 +521,21 @@ def build_turn_summary(data: pd.DataFrame, events: Dict[str, pd.Series]) -> pd.D
     has_sector = has_sector_data(data)
     sector_col = "sector_name" if "sector_name" in data.columns else "gps_sector" if "gps_sector" in data.columns else None
 
-    for turn_id in sorted(data["corner_id"].unique()):
-        if turn_id <= 0:
-            continue
+    corner_ids = [cid for cid in sorted(data["corner_id"].unique()) if cid > 0]
+    
+    # Handle case of no corners detected
+    if not corner_ids:
+        return pd.DataFrame([{
+            "Turn": "No Corners",
+            "Distance (m)": "—",
+            "Entry Speed (km/h)": round(float(data["speed"].mean()), 1),
+            "Min Speed (km/h)": round(float(data["speed"].min()), 1),
+            "Peak Slip (°)": round(float(data["slip_severity"].max()), 1),
+            "Max Lateral G": round(float(data["lateral_accel"].max()), 2),
+            "Issues": "Insufficient steering activity detected",
+        }])
 
+    for turn_id in corner_ids:
         segment = data[data["corner_id"] == turn_id]
         start_idx = int(segment.index.min())
         end_idx = int(segment.index.max())
@@ -528,11 +599,16 @@ def build_sector_summary(data: pd.DataFrame, events: Dict[str, pd.Series]) -> Op
             if events[key].loc[start_idx:end_idx].any():
                 issues.append(EVENT_STYLES[key]["label"])
         
-        sector_dist = float(segment["distance_traveled"].iloc[-1] - segment["distance_traveled"].iloc[0])
+        # Calculate proper sector distance
+        sector_start_dist = float(segment["distance_traveled"].min())
+        sector_end_dist = float(segment["distance_traveled"].max())
+        sector_dist = sector_end_dist - sector_start_dist
         
         row = {
             "Sector": str(sector_id),
-            "Distance (m)": f"{segment['distance_traveled'].iloc[0]:.0f}-{segment['distance_traveled'].iloc[-1]:.0f}",
+            "Start (m)": f"{sector_start_dist:.0f}",
+            "End (m)": f"{sector_end_dist:.0f}",
+            "Length (m)": f"{sector_dist:.0f}",
             "Avg Speed": round(float(segment["speed"].mean()), 1),
             "Peak Slip (°)": round(float(segment["slip_severity"].max()), 1),
             "Max Lateral G": round(float(segment["lateral_accel"].max()), 2),
@@ -614,7 +690,7 @@ def generate_insights(
     if event_counts["wheel_spin"] > 0:
         turn_id, distance = dominant_location_label(data, events["wheel_spin"])
         location_str = f"T{turn_id} (~{distance:.0f}m)" if turn_id > 0 else f"~{distance:.0f}m"
-        add(84, f"[TRACTION LOSS @{location_str}] Wheelspin on exit under acceleration. "
+        add(84, f"[LONGITUDINAL WHEEL SLIDE @{location_str}] Wheelspin on exit under acceleration. "
                 f"Driver: wait for steering <5° before full throttle, squeeze progressively. "
                 f"Setup: increase rear spring +10%, rear ARB +20%, reduce rear rebound damping -10%.")
 
@@ -723,11 +799,19 @@ def build_stats(data: pd.DataFrame) -> Dict[str, float]:
 
 
 def analyze_uploaded_file(uploaded_file) -> AnalysisBundle:
+    # Set random seed for reproducibility before any analysis
+    np.random.seed(42)
+    
     raw_df = read_csv_bytes(uploaded_file.getvalue())
+    # Sort by time to ensure consistent ordering
+    raw_df = raw_df.sort_values("time", ignore_index=True)
+    
     cleaned = clean_telemetry_data(raw_df)
     featured = engineer_features(cleaned)
     thresholds = compute_thresholds(featured)
     zoned = add_zone_columns(featured, thresholds)
+    # Add corner phase information (ENTRY, MID, EXIT)
+    zoned["corner_phase"] = detect_corner_phases(zoned)
     events = detect_events(zoned, thresholds)
     event_counts = {key: count_segments(mask) for key, mask in events.items()}
     scores = compute_scores(zoned, events, thresholds)
@@ -855,6 +939,13 @@ def build_speed_figure(bundle: AnalysisBundle) -> go.Figure:
             hovertemplate="Distance: %{x:.1f}m<br>Speed: %{y:.1f} km/h<extra></extra>",
         )
     )
+    
+    # Add turn number markers on X-axis
+    for turn_id in sorted(data[data["corner_id"] > 0]["corner_id"].unique()):
+        turn_segment = data[data["corner_id"] == turn_id]
+        turn_distance = float(turn_segment["distance_traveled"].mean())
+        fig.add_vline(x=turn_distance, line_dash="dash", line_color="rgba(100,100,100,0.3)", annotation_text=f"T{int(turn_id)}", annotation_position="top")
+    
     return style_figure(fig, "Speed vs Distance Traveled", "Distance (m)", "Speed (km/h)")
 
 
@@ -884,6 +975,13 @@ def build_controls_figure(bundle: AnalysisBundle) -> go.Figure:
             hovertemplate="Distance: %{x:.1f}m<br>Brake: %{y:.1f}%<extra></extra>",
         )
     )
+    
+    # Add turn number markers on X-axis
+    for turn_id in sorted(data[data["corner_id"] > 0]["corner_id"].unique()):
+        turn_segment = data[data["corner_id"] == turn_id]
+        turn_distance = float(turn_segment["distance_traveled"].mean())
+        fig.add_vline(x=turn_distance, line_dash="dash", line_color="rgba(100,100,100,0.3)", annotation_text=f"T{int(turn_id)}", annotation_position="top")
+    
     return style_figure(fig, "Throttle & Brake vs Distance", "Distance (m)", "Pedal Input (%)")
 
 
@@ -916,6 +1014,13 @@ def build_lateral_accel_figure(bundle: AnalysisBundle) -> go.Figure:
             hovertemplate="Distance: %{x:.1f}m<br>Lateral G: %{y:.2f}<extra></extra>",
         )
     )
+    
+    # Add turn number markers on X-axis
+    for turn_id in sorted(data[data["corner_id"] > 0]["corner_id"].unique()):
+        turn_segment = data[data["corner_id"] == turn_id]
+        turn_distance = float(turn_segment["distance_traveled"].mean())
+        fig.add_vline(x=turn_distance, line_dash="dash", line_color="rgba(100,100,100,0.3)", annotation_text=f"T{int(turn_id)}", annotation_position="top")
+    
     return style_figure(fig, "Lateral Acceleration vs Distance", "Distance (m)", "Lateral G (m/s²)")
 
 
@@ -994,6 +1099,13 @@ def build_steering_yaw_figure(bundle: AnalysisBundle) -> go.Figure:
             mirror=True
         ),
     )
+    
+    # Add turn number markers on X-axis
+    for turn_id in sorted(data[data["corner_id"] > 0]["corner_id"].unique()):
+        turn_segment = data[data["corner_id"] == turn_id]
+        turn_distance = float(turn_segment["distance_traveled"].mean())
+        fig.add_vline(x=turn_distance, line_dash="dash", line_color="rgba(100,100,100,0.3)", annotation_text=f"T{int(turn_id)}", annotation_position="top")
+    
     return fig
 
 
@@ -1019,6 +1131,12 @@ def build_rpm_evolution_figure(bundle: AnalysisBundle) -> go.Figure:
         annotation_text="Efficient RPM band",
         annotation_position="top left",
     )
+    
+    # Add turn number markers on X-axis
+    for turn_id in sorted(data[data["corner_id"] > 0]["corner_id"].unique()):
+        turn_segment = data[data["corner_id"] == turn_id]
+        turn_distance = float(turn_segment["distance_traveled"].mean())
+        fig.add_vline(x=turn_distance, line_dash="dash", line_color="rgba(100,100,100,0.3)", annotation_text=f"T{int(turn_id)}", annotation_position="top")
     
     fig = style_figure(fig, "RPM Evolution vs Distance", "Distance (m)", "RPM", height=380)
     return fig
@@ -1145,13 +1263,17 @@ def build_track_map_figure(
 
     if selected_index is not None:
         snapshot = data.iloc[selected_index]
+        # Show position marker with distance label
         fig.add_trace(
             go.Scatter(
                 x=[snapshot["longitude"]],
                 y=[snapshot["latitude"]],
-                mode="markers",
-                name="Position",
-                marker=dict(color="#111111", size=16, symbol="star"),
+                mode="markers+text",
+                name="Current Pos",
+                marker=dict(color="#ff6b35", size=18, symbol="circle", line=dict(color="white", width=2)),
+                text=[f"Pos: {snapshot['distance_traveled']:.0f}m"],
+                textposition="top center",
+                hovertemplate=f"Distance: {snapshot['distance_traveled']:.0f}m<br>Speed: {snapshot['speed']:.1f} km/h<extra></extra>",
             )
         )
 
@@ -1160,36 +1282,52 @@ def build_track_map_figure(
 
 
 def render_summary_metrics(bundle: AnalysisBundle) -> None:
-    stats_columns = st.columns(4)
+    """Enhanced summary metrics with better UI and insights"""
     
-    # Explicit type conversion and validation  
+    # Main performance metrics
+    st.markdown("### 🏁 Lap Performance")
+    perf_cols = st.columns(4)
+    
     lap_time_val = float(bundle.lap_time) if bundle.lap_time is not None else 0.0
     lap_distance_val = float(bundle.stats.get('lap_distance', 0)) if bundle.stats.get('lap_distance') is not None else 0.0
     avg_speed_val = float(bundle.stats.get('average_speed', 0)) if bundle.stats.get('average_speed') is not None else 0.0
     top_speed_val = float(bundle.stats.get('top_speed', 0)) if bundle.stats.get('top_speed') is not None else 0.0
     
-    # DEBUG: Log values
-    with st.empty():
-        pass  # Hidden debug container
+    perf_cols[0].metric("⏱️ Lap Time", f"{lap_time_val:.2f}s")
+    perf_cols[1].metric("📏 Distance", f"{lap_distance_val:.0f}m")
+    perf_cols[2].metric("📊 Avg Speed", f"{avg_speed_val:.1f} km/h")
+    perf_cols[3].metric("🚀 Top Speed", f"{top_speed_val:.1f} km/h")
     
-    stats_columns[0].metric("Lap Time", f"{lap_time_val:.2f}s")
-    stats_columns[1].metric("Total Distance", f"{lap_distance_val:.0f}m")
-    stats_columns[2].metric("Average Speed", f"{avg_speed_val:.1f} km/h")
-    stats_columns[3].metric("Top Speed", f"{top_speed_val:.1f} km/h")
+    # Driving quality scores
+    st.markdown("### 📈 Driver Performance Scores")
+    score_cols = st.columns(4)
     
-    # Show debug info in expander for troubleshooting
-    with st.expander("🔧 Debug Info"):
-        st.write(f"**Bundle lap_time (raw):** {bundle.lap_time}")
-        st.write(f"**Bundle stats:** {bundle.stats}")
-        st.write(f"**Lap time calculated value:** {lap_time_val}")
-        st.write(f"**Distance calculated value:** {lap_distance_val}")
-
-    event_columns = st.columns(5)
-    event_columns[0].metric("Oversteer", bundle.event_counts["oversteer"])
-    event_columns[1].metric("Understeer", bundle.event_counts["understeer"])
-    event_columns[2].metric("Harsh Braking", bundle.event_counts["harsh_braking"])
-    event_columns[3].metric("Traction Loss", bundle.event_counts["wheel_spin"])
-    # Instability metric removed - use oversteer/understeer counts instead
+    consistency = bundle.scores.get("consistency_score", 0)
+    handling = bundle.scores.get("handling_score", 0)
+    stability = bundle.scores.get("stability_score", 0)
+    
+    # Color code the scores
+    def score_color(score):
+        if score >= 90:
+            return "🟢"
+        elif score >= 70:
+            return "🟡"
+        else:
+            return "🔴"
+    
+    score_cols[0].metric("Consistency", f"{consistency:.0f}/100", delta=f"{score_color(consistency)}")
+    score_cols[1].metric("Handling", f"{handling:.0f}/100", delta=f"{score_color(handling)}")
+    score_cols[2].metric("Stability", f"{stability:.0f}/100", delta=f"{score_color(stability)}")
+    score_cols[3].metric("Grade", bundle.grade)
+    
+    # Event summary with icons
+    st.markdown("### ⚠️ Driving Events")
+    event_cols = st.columns(5)
+    event_cols[0].metric("Oversteer", bundle.event_counts.get("oversteer", 0), "↗️")
+    event_cols[1].metric("Understeer", bundle.event_counts.get("understeer", 0), "↙️")
+    event_cols[2].metric("Harsh Braking", bundle.event_counts.get("harsh_braking", 0), "🛑")
+    event_cols[3].metric("Traction Loss", bundle.event_counts.get("wheel_spin", 0), "🎡")
+    event_cols[4].metric("Late Braking", bundle.event_counts.get("late_braking", 0), "⏱️")
 
 
 def render_insights(bundle: AnalysisBundle) -> None:
@@ -1257,12 +1395,105 @@ def render_ml_insights(bundle: AnalysisBundle) -> None:
                 st.caption(f"→ {recommendation}")
 
 
+def render_driver_feedback(bundle: AnalysisBundle) -> None:
+    """Display personalized driver feedback and recommendations - SEPARATED by type"""
+    st.markdown("---")
+    st.markdown("### 💡 Driver Feedback & Recommendations")
+    
+    # Split feedback columns
+    feedback_col1, feedback_col2 = st.columns(2)
+    
+    with feedback_col1:
+        st.markdown("#### 👤 Driver Technique Improvements")
+        if bundle.scores.get("consistency_score", 0) < 70:
+            st.warning("⚠️ **Braking Depth:** Vary brake pressure inconsistently between corners")
+            st.caption("👉 Apply brakes progressively, not abruptly. Release earlier to allow grip for cornering.")
+        
+        if bundle.event_counts.get("oversteer", 0) > 2:
+            st.warning("⚠️ **Steering Angle:** Excessive lock through high-speed turns")
+            st.caption("👉 Reduce steering wheel angle by 10-15% in quick direction changes. Avoid sudden corrections.")
+        
+        if bundle.event_counts.get("harsh_braking", 0) > 1:
+            st.warning("⚠️ **Braking Modulation:** Jerky pedal inputs causing platform upset")
+            st.caption("👉 Build pedal pressure smoothly over 0.5-1.0s. Think 'squeeze' not 'stab'.")
+        
+        if bundle.scores.get("stability_score", 0) < 75:
+            st.warning("⚠️ **Throttle Control:** Inconsistent acceleration out of corners")
+            st.caption("👉 Feed throttle progressively as steering input reduces. Avoid sudden full throttle.")
+        
+        if bundle.event_counts.get("late_braking", 0) > 0:
+            st.info("💡 **Braking Point:** Braking too late into corners")
+            st.caption("👉 Brake 0.5-1.0s earlier. Use a consistent braking point each lap.")
+        
+        if not (bundle.event_counts.get("oversteer", 0) or bundle.event_counts.get("harsh_braking", 0)):
+            st.success("✅ **Smooth operator:** Your technique is well-controlled and consistent!")
+    
+    with feedback_col2:
+        st.markdown("#### 🔧 Suspension & Setup Changes (SUSPENSION ONLY)")
+        
+        if bundle.event_counts["oversteer"] > 0:
+            st.warning("⚠️ **Oversteer Detected**")
+            st.caption("→ **Rear ARB:** Increase by +15-20% to increase rear roll stiffness")
+            st.caption("→ **Front ARB:** Reduce by -10% to decrease understeer tendency")
+            st.caption("→ **Front Damping:** Increase rebound by +10-15% for better turn-in control")
+        
+        if bundle.event_counts["understeer"] > 0:
+            st.warning("⚠️ **Understeer Detected**")
+            st.caption("→ **Front ARB:** Reduce by -15-20% for more front grip")
+            st.caption("→ **Front Camber:** Increase negative camber by -0.3° to -0.5°")
+            st.caption("→ **Front Ride Height:** Lower front by 5-8mm for aerodynamic downforce")
+        
+        if bundle.event_counts["harsh_braking"] > 0:
+            st.info("💡 **Braking Platform Harshness**")
+            st.caption("→ **Front Springs:** Soften by -8-10% to absorb braking load")
+            st.caption("→ **Front Damping:** Reduce rebound by -5-8% for smoother platform")
+            st.caption("→ **Brake Bias:** Shift 1% forward for rear stability during heavy braking")
+        
+        if bundle.event_counts.get("wheel_spin", 0) > 0:
+            st.info("💡 **Longitudinal Wheel Slide on Exit**")
+            st.caption("→ **Rear Spring:** Increase by +8-12% for traction on acceleration")
+            st.caption("→ **Rear ARB:** Increase by +15-20% to control wheelspin")
+            st.caption("→ **Rear Rebound Damping:** Reduce by -8-12% for faster load transfer")
+    
+    # Detailed recommendations (collapsed)
+    with st.expander("📋 Complete Setup Guide"):
+        st.markdown("""
+        **Anti-Roll Bar (ARB) Adjustments:**
+        - Increasing ARB stiffness reduces roll, increases understeer initially, and improves mid-corner control
+        - Front ARB affects turn-in and mid-corner balance; Rear ARB affects corner exit stability
+        - Typical range: ±20% from baseline for sensible changes
+        
+        **Damping (Shock): Rebound & Bump:**
+        - Rebound damping controls how fast spring extends; higher = more stability but less grip
+        - Bump damping controls compression; higher = stiffer platform but can lose grip over bumps
+        - Front rebound more critical for turn-in; Rear rebound critical for exit stability
+        
+        **Spring Rate Changes:**
+        - Stiffer springs (+) reduce roll and elevate platform, lower ride heights
+        - Softer springs (-) improve compliance but increase roll and instability
+        - Changes typically ±5-15% for measurable effect
+        
+        **Brake Balance:**
+        - Forward = more braking force at front; helps with stability but risks front locking
+        - Rearward = more rear braking; helps with rear grip but risks spin
+        - Typical range: 55-65% front bias (45-35% rear)
+        
+        **Ride Height & Aero:**
+        - Lower front → more downforce → more grip but lighter rear end
+        - Typical range: ±5mm per adjustment, max 10mm per session
+        """)
+
 
 def render_overview(bundle: AnalysisBundle) -> None:
     render_summary_metrics(bundle)
+    st.divider()
     render_insights(bundle)
+    st.divider()
+    render_driver_feedback(bundle)
+    st.divider()
     if bundle.ml_results is not None and ML_AVAILABLE:
         render_ml_insights(bundle)
+        st.divider()
     render_turn_table(bundle)
     render_sector_table(bundle)
 
@@ -1275,19 +1506,19 @@ def render_charts(bundle: AnalysisBundle) -> None:
     with chart_col_2:
         st.plotly_chart(build_controls_figure(bundle), use_container_width=True)
     
-    # Second row: Slip and Lateral Accel
+    # Second row: Lateral Accel (removed Slip Angle vs Distance)
     chart_col_1, chart_col_2 = st.columns(2)
     with chart_col_1:
-        st.plotly_chart(build_slip_figure(bundle), use_container_width=True)
-    with chart_col_2:
         st.plotly_chart(build_lateral_accel_figure(bundle), use_container_width=True)
+    with chart_col_2:
+        st.plotly_chart(build_steering_yaw_figure(bundle), use_container_width=True)
     
-    # Third row: Steering & Yaw and RPM
+    # Third row: RPM
     chart_col_1, chart_col_2 = st.columns(2)
     with chart_col_1:
-        st.plotly_chart(build_steering_yaw_figure(bundle), use_container_width=True)
-    with chart_col_2:
         st.plotly_chart(build_rpm_evolution_figure(bundle), use_container_width=True)
+    with chart_col_2:
+        st.info("💡 Slip Angle is analyzed in Turn-by-Turn Summary and Track Map visualizations")
     
     # Optional: Cornering speed visualization
     cornering_fig = build_cornering_speed_figure(bundle)
@@ -1377,18 +1608,50 @@ def render_comparison(primary: AnalysisBundle, comparison: AnalysisBundle) -> No
 
 
 def main() -> None:
-    st.set_page_config(page_title="Handling Dynamics Analysis System", layout="wide")
+    st.set_page_config(page_title="AMTAS - Automated Motorsports Telemetry Analysis System", layout="wide")
+    
+    # Motorsports-themed custom CSS
     st.markdown(
         """
         <style>
-        .block-container { padding-top: 1.4rem; padding-bottom: 2rem; }
-        [data-testid="stMetricValue"] { font-size: 1.8rem; }
+        /* Motorsports theme: racing red and dark background */
+        .block-container { 
+            padding-top: 1.4rem; 
+            padding-bottom: 2rem;
+            background: linear-gradient(135deg, #0a0a0a 0%, #1a1a2e 100%);
+        }
+        [data-testid="stMetricValue"] { 
+            font-size: 1.8rem;
+            font-family: 'Monaco', 'Courier New', monospace;
+            color: #ff6b35;
+        }
+        h1, h2, h3, h4, h5, h6 {
+            font-family: 'Segoe UI', sans-serif;
+            color: #ffb627;
+            text-shadow: 0 2px 4px rgba(255, 107, 53, 0.3);
+        }
+        .stTabs [data-baseweb="tab-list"] button {
+            background-color: #1a1a2e;
+            border-bottom: 3px solid #333;
+            color: #ffffff;
+            font-weight: bold;
+        }
+        .stTabs [aria-selected="true"] {
+            border-bottom: 3px solid #ff6b35;
+            color: #ffb627;
+        }
+        .stMetric {
+            background-color: rgba(255, 107, 53, 0.1);
+            border-left: 4px solid #ff6b35;
+            padding: 12px;
+            border-radius: 4px;
+        }
         </style>
         """,
         unsafe_allow_html=True,
     )
 
-    st.title("🏎️ Handling Dynamics Analysis System")
+    st.title("🏁 Automated Motorsports Telemetry Analysis System (AMTAS)")
     st.write("Upload race telemetry CSV files for corner-by-corner handling analysis with driver technique and suspension setup recommendations. **All data is analyzed against distance traveled, not time.**")
 
     with st.expander("Expected CSV schema"):
