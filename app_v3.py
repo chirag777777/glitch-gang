@@ -85,6 +85,25 @@ try:
 except ImportError:
     ORIGINAL_AVAILABLE = False
 
+# Import advanced track features
+try:
+    from advanced_track_features import (
+        create_lap_comparison_overlay,
+        create_lap_delta_comparison,
+        create_performance_heat_grid,
+        create_2d_performance_heatmap,
+        filter_by_distance_range,
+        filter_by_speed_range,
+        segment_by_corners,
+        segment_by_events,
+        generate_lap_summary_stats,
+        create_comparison_metrics_table,
+        create_performance_report
+    )
+    ADVANCED_TRACK_AVAILABLE = True
+except ImportError:
+    ADVANCED_TRACK_AVAILABLE = False
+
 
 # ============================================================================
 # PAGE CONFIG
@@ -426,6 +445,112 @@ def render_premium_features(primary_df: pd.DataFrame, secondary_df: Optional[pd.
                 st.metric("Time", f"{sector_info['time_in_sector']:.2f}s")
 
 
+def render_advanced_track_features(df: pd.DataFrame, secondary_file=None):
+    """Render advanced track analysis features"""
+    
+    if not ADVANCED_TRACK_AVAILABLE:
+        st.warning("Advanced track features module not available")
+        return
+    
+    # Create tabs for different analysis modes
+    analysis_tabs = st.tabs([
+        "📊 Performance Grid",
+        "🔥 Heat Maps",
+        "⚡ Filtering",
+        "📋 Statistics"
+    ])
+    
+    with analysis_tabs[0]:
+        st.markdown("### Performance Heat Grid")
+        col1, col2 = st.columns([3, 1])
+        with col2:
+            grid_size = st.slider("Grid Segments", 5, 20, 10)
+        
+        fig = create_performance_heat_grid(df, grid_size=grid_size)
+        st.plotly_chart(fig, use_container_width=True)
+    
+    with analysis_tabs[1]:
+        st.markdown("### 2D Performance Heatmaps")
+        col1, col2 = st.columns([2, 2])
+        
+        with col1:
+            metric1 = st.selectbox("Select Metric", ['speed', 'steering', 'throttle', 'brake'], key="hm1")
+            fig1 = create_2d_performance_heatmap(df, metric=metric1)
+            st.plotly_chart(fig1, use_container_width=True)
+        
+        with col2:
+            metric2 = st.selectbox("Select Metric", ['steering', 'speed', 'throttle', 'brake'], key="hm2", index=1)
+            fig2 = create_2d_performance_heatmap(df, metric=metric2)
+            st.plotly_chart(fig2, use_container_width=True)
+    
+    with analysis_tabs[2]:
+        st.markdown("### Distance & Speed Filtering")
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.markdown("#### Filter by Distance Range")
+            if 'distance_traveled' in df.columns:
+                max_dist = df['distance_traveled'].max()
+                start_dist = st.slider("Start Distance (m)", 0.0, max_dist, 0.0)
+                end_dist = st.slider("End Distance (m)", 0.0, max_dist, max_dist)
+                
+                filtered_df = filter_by_distance_range(df, start_dist, end_dist)
+                st.success(f"✓ Filtered to {len(filtered_df)} rows ({start_dist:.0f}m - {end_dist:.0f}m)")
+        
+        with col2:
+            st.markdown("#### Filter by Speed Range")
+            if 'speed' in df.columns:
+                min_speed = st.slider("Min Speed (km/h)", 0.0, df['speed'].max(), 0.0)
+                max_speed = st.slider("Max Speed (km/h)", 0.0, df['speed'].max(), df['speed'].max())
+                
+                filtered_df = filter_by_speed_range(df, min_speed, max_speed)
+                st.success(f"✓ Filtered to {len(filtered_df)} rows ({min_speed:.0f} - {max_speed:.0f} km/h)")
+        
+        st.divider()
+        
+        # Segment by corners
+        st.markdown("#### Automatic Corner/Straight Segmentation")
+        if 'steering_angle' in df.columns:
+            threshold = st.slider("Steering Threshold (°)", 5, 45, 15)
+            segments = segment_by_corners(df, steering_threshold=threshold)
+            
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.metric("Total Segments", len(segments))
+            with col2:
+                st.metric("Corners", len(segments.get('corners', [])))
+            with col3:
+                st.metric("Straights", len(segments.get('straights', [])))
+    
+    with analysis_tabs[3]:
+        st.markdown("### Lap Statistics & Comparison")
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.markdown("#### Primary Lap Stats")
+            stats = generate_lap_summary_stats(df)
+            
+            for metric, value in stats.items():
+                metric_display = metric.replace('_', ' ').title()
+                st.metric(metric_display, f"{value:.2f}")
+        
+        with col2:
+            st.markdown("#### Performance Report")
+            report = create_performance_report(df, "Primary Lap Analysis")
+            st.code(report, language="text")
+        
+        st.divider()
+        
+        # Comparison if secondary file provided
+        if secondary_file:
+            st.markdown("#### Lap Comparison Table")
+            secondary_df = pd.read_csv(secondary_file)
+            comparison_table = create_comparison_metrics_table(df, secondary_df)
+            st.dataframe(comparison_table, use_container_width=True)
+
+
 # ============================================================================
 # MAIN APP LOGIC
 # ============================================================================
@@ -463,7 +588,8 @@ def main():
             "🎨 Track & Style", 
             "🤖 ML Analysis",
             "⭐ Premium",
-            "📈 Comparison" if secondary_file else "ℹ️ Info"
+            "�️ Advanced Track",
+            "�📈 Comparison" if secondary_file else "ℹ️ Info"
         ])
         
         with tabs[0]:
@@ -492,6 +618,10 @@ def main():
             render_premium_features(df, secondary_df)
         
         with tabs[4]:
+            st.markdown("## 🗺️ Advanced Track Analysis")
+            render_advanced_track_features(df, secondary_file)
+        
+        with tabs[5]:
             if secondary_file:
                 secondary_df = pd.read_csv(secondary_file)
                 
